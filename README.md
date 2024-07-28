@@ -1,2 +1,1 @@
 # Variational Diffusion Autoencoder
-# vdae
