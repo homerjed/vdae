@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import jax.random as jr 
+from jaxtyping import Key, Array
 import torch
 from torchvision import transforms, datasets
 
@@ -62,7 +63,7 @@ class Scaler:
 
 
 class _TorchDataLoader(_AbstractDataLoader):
-    def __init__(self, dataset, num_workers=2, *, key):
+    def __init__(self, dataset: Tuple[Array, ...], num_workers: int = 2, *, key: Key):
         self.dataset = dataset
         self.seed = int(key.sum().item()) 
         self.num_workers = num_workers
@@ -95,7 +96,7 @@ class ScalerDataset:
     scaler: Scaler
 
 
-def mnist(key: jr.PRNGKey) -> ScalerDataset:
+def mnist(key: Key) -> ScalerDataset:
     key_train, key_valid = jr.split(key)
     n_pix = 32 # Force power of 2 resolution
     data_shape = (1, n_pix, n_pix)
