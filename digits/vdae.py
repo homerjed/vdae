@@ -6,12 +6,12 @@ import equinox as eqx
 import diffrax as dfx
 from jaxtyping import Key, Array
 import optax
-import numpy as np 
 import einops
-from tqdm import trange
+from sklearn import datasets
+from tqdm.notebook import trange
 import matplotlib.pyplot as plt
 
-from models import Mixer2d
+from models import ResidualNetwork
 
 
 class Encoder(eqx.Module):
@@ -41,12 +41,13 @@ class Encoder(eqx.Module):
         # Score of variational distribution q(z|x_t, t) defined by encoder
         return jax.jacfwd(self.variational_posterior_log_prob, argnums=2)(key, x, x_t, t)
 
+    def prior_log_prob_z(self, z):
+        return jax.scipy.stats.norm.logpdf(z).sum() # Unit Gaussian 
+
 
 def kl_loss(mu, sigma):
     # Assuming sigma is diagonal elements of covariance (NOTE: sigma exp'd)
-    # return mu.T @ mu + sigma.sum() - mu.size - jnp.prod(sigma)
-    log_var = jnp.log(sigma ** 2.)
-    return 0.5 * jnp.sum(1. + log_var - mu ** 2. - jnp.exp(log_var))
+    return mu.T @ mu + sigma.sum() - mu.size - jnp.prod(sigma)
 
 
 def int_beta(t):
@@ -75,7 +76,7 @@ def dataloader(x, batch_size, *, key):
 def single_loss_fn(encoder, score_network, weight, int_beta, x, t, key):
     # Encoder training objective given trained diffusion model
     key_score, key_noise = jr.split(key)
-    # t = jnp.atleast_1d(t)
+    t = jnp.atleast_1d(t)
 
     # Diffusion loss calculations
     mean = x * jnp.exp(-0.5 * int_beta(t))
@@ -117,8 +118,21 @@ def make_step(encoder, score_network, weight, int_beta, x, t1, key, opt_state, o
     return loss, encoder, key, opt_state
 
 
+class SinusoidalPosEmb(eqx.Module):
+    emb: jax.Array
+
+    def __init__(self, dim):
+        half_dim = dim // 2
+        emb = jnp.log(10000.) / (half_dim - 1)
+        self.emb = jnp.exp(jnp.arange(half_dim) * -emb)
+
+    def __call__(self, x):
+        emb = x * jax.lax.stop_gradient(self.emb) 
+        emb = jnp.concatenate((jnp.sin(emb), jnp.cos(emb)), axis=-1)
+        return emb
+
+
 def q_z_x_t_t(encoder, z, x_t, t):
-    # z ~ q(z|mu_0, sigma_0)
     mu_t, sigma_t = encoder.encode(x_t, t)
     return jax.scipy.stats.multivariate_normal.logpdf(z, mu_t, jnp.diag(sigma_t))
 
@@ -147,33 +161,35 @@ def single_sample_fn(
 
 
 if __name__ == "__main__":
-    from data import mnist
+    key = jr.key(0)
 
-    key = jr.PRNGKey(0)
+    data = datasets.load_digits()
+    X, Y = data["data"], data["target"]
+    X, Y = jnp.asarray(X), jnp.asarray(Y)[:, jnp.newaxis]
 
     # Data
-    dataset = mnist(key)
-    data_shape = dataset.data_shape
-    data_dim = np.prod(dataset.data_shape)
+    _, data_dim = X.shape
     latent_dim = 8
-    latent_shape = (latent_dim,)
+    embed_dim = 16
     # Training
-    t1 = 10.
-    batch_size = 500 
+    t1 = 1.
+    batch_size = 1000 
     lr = 1e-4
-    num_steps = 8_000
+    num_steps = 200
     # Sampling
+    data_shape = (data_dim,)
+    latent_shape = (latent_dim,)
     dt0 = 0.01
-    sample_size = 4
+    sample_size = 1
 
-    score_network = Mixer2d(
-        (1, 32, 32),
-        patch_size=4, 
-        hidden_size=512,
-        mix_patch_size=512,
-        mix_hidden_size=512,
-        num_blocks=4,
-        t1=10.,
+    score_network = ResidualNetwork(
+        in_size=data_dim, 
+        out_size=data_dim, 
+        width_size=512, 
+        depth=2, 
+        y_dim=embed_dim, # Just scalar time
+        activation=jax.nn.gelu, 
+        time_embedder=SinusoidalPosEmb(embed_dim),
         key=key
     )
 
@@ -183,7 +199,7 @@ if __name__ == "__main__":
         dict(
             in_size=data_dim + 1, # [x_t, t]
             out_size=2 * latent_dim, # Latent dim = 1, outputing mu, sigma
-            width_size=512, 
+            width_size=128, 
             depth=2, 
             activation=jax.nn.tanh
         ),
@@ -197,16 +213,14 @@ if __name__ == "__main__":
 
     losses = []
     with trange(num_steps) as bar:
-        for step, (x, y) in zip(
-            bar, dataset.train_dataloader.loop(batch_size)
-        ):
+        for step, data in zip(bar, dataloader(X, batch_size, key=loader_key)):
 
             value, encoder, train_key, opt_state = make_step(
                 encoder, 
                 score_network, 
                 weight, 
                 int_beta, 
-                x, 
+                data, 
                 t1, 
                 train_key, 
                 opt_state, 
@@ -215,11 +229,6 @@ if __name__ == "__main__":
 
             losses.append(value)
             bar.set_postfix_str(f"Loss={value:.3E}")
-
-    plt.figure(dpi=200)
-    plt.semilogy(losses)
-    plt.savefig("figs/loss_vdae.png", bbox_inches="tight")
-    plt.close()
 
 
     def q_z_x_t_t(encoder, z, x_t, t):
@@ -266,67 +275,14 @@ if __name__ == "__main__":
 
     sample = einops.rearrange(
         sample, 
-        "(n1 n2) 1 h w -> (n1 h) (n2 w)", 
+        "(n1 n2) (h w) -> (n1 h) (n2 w)", 
         n1=sample_size, 
         n2=sample_size, 
-        h=32, 
-        w=32
+        h=8, 
+        w=8
     )
 
-    plt.figure(dpi=200)
+    plt.figure()
     plt.imshow(sample, cmap="gray_r")
     plt.axis("off")
-    plt.savefig("figs/samples_vdae.png", bbox_inches="tight")
-    plt.close()
-
-    z = jr.normal(key, latent_shape) # Sample latents like a VAE
-
-    @eqx.filter_jit
-    def single_sample_fn(
-        score_network, encoder, int_beta, data_shape, latent_shape, dt0, t1, key
-    ):
-
-        def drift(t, y, args):
-            (z, encoder) = args
-            _, beta = jax.jvp(int_beta, (t,), (jnp.ones_like(t),))
-            # Score of variational posterior
-            score_q = jax.jacfwd(q_z_x_t_t, argnums=2)(encoder, z, y, t)
-            score = score_network(y, t)
-            return -0.5 * beta * (y + (score + score_q)) 
-
-        key_y1, key_z = jr.split(key)
-        term = dfx.ODETerm(drift)
-        solver = dfx.Tsit5()
-        t0 = 0.
-        y1 = jr.normal(key_y1, data_shape)
-        sol = dfx.diffeqsolve(term, solver, t1, t0, -dt0, y1, args=(z, encoder)) # Reverse time, solve from t1 to t0
-        return sol.ys[0]
-
-    key, sample_key = jr.split(key)
-    sample_keys = jr.split(sample_key, sample_size ** 2)
-    sample_fn = partial(
-        single_sample_fn, 
-        score_network, 
-        encoder, 
-        int_beta, 
-        data_shape, 
-        latent_shape, 
-        dt0, 
-        t1
-    )
-    sample = jax.vmap(sample_fn)(sample_keys)
-
-    sample = einops.rearrange(
-        sample, 
-        "(n1 n2) 1 h w -> (n1 h) (n2 w)", 
-        n1=sample_size, 
-        n2=sample_size, 
-        h=32, 
-        w=32
-    )
-
-    plt.figure(dpi=200)
-    plt.imshow(sample, cmap="gray_r")
-    plt.axis("off")
-    plt.savefig("figs/samples_vdae_z.png", bbox_inches="tight")
-    plt.close()
+    plt.show()

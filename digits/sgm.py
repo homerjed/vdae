@@ -2,16 +2,15 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jax.sharding import NamedSharding, Mesh, PartitionSpec as P
 import equinox as eqx
 import diffrax as dfx  
 import optax  
 import einops
 import matplotlib.pyplot as plt
-import numpy as np
+from sklearn import datasets
 from tqdm import trange
 
-from models import Mixer2d
+from models import ResidualNetwork
 
 
 def int_beta(t):
@@ -72,38 +71,64 @@ def make_step(model, weight, int_beta, data, t1, key, opt_state, opt_update):
     return loss, model, key, opt_state
 
 
+def dataloader(data, batch_size, *, key):
+    dataset_size = data.shape[0]
+    indices = jnp.arange(dataset_size)
+    while True:
+        key, subkey = jr.split(key, 2)
+        perm = jr.permutation(subkey, indices)
+        start = 0
+        end = batch_size
+        while end < dataset_size:
+            batch_perm = perm[start:end]
+            yield data[batch_perm]
+            start = end
+            end = start + batch_size
+
+
+class SinusoidalPosEmb(eqx.Module):
+    emb: jax.Array
+
+    def __init__(self, dim):
+        half_dim = dim // 2
+        emb = jnp.log(10000.) / (half_dim - 1)
+        self.emb = jnp.exp(jnp.arange(half_dim) * -emb)
+
+    def __call__(self, x):
+        emb = x * jax.lax.stop_gradient(self.emb) 
+        emb = jnp.concatenate((jnp.sin(emb), jnp.cos(emb)), axis=-1)
+        return emb
+
+
 if __name__ == "__main__":
-    from data import mnist
+    key = jr.key(0)
 
-    key = jr.PRNGKey(0)
+    data = datasets.load_digits()
+    X, Y = data["data"], data["target"]
+    X, Y = jnp.asarray(X), jnp.asarray(Y)[:, jnp.newaxis]
 
-    # Data
-    dataset = mnist(key)
-    data_dim = np.prod(dataset.data_shape)
-    data_shape = dataset.data_shape
+    _, data_dim = X.shape
+    data_shape = (data_dim,)
     embed_dim = 16
-    # Training
-    t1 = 10.
+
+    t1 = 1.
     batch_size = 1000 
-    lr = 2e-4
+    lr = 1e-4
     num_steps = 500_000
-    # Sampling
+
     dt0 = 0.01
     sample_size = 4
 
-    model = Mixer2d(
-        (1, 32, 32),
-        patch_size=4, 
-        hidden_size=512,
-        mix_patch_size=512,
-        mix_hidden_size=512,
-        num_blocks=4,
-        t1=10.,
+    model = ResidualNetwork(
+        in_size=data_dim, 
+        out_size=data_dim, 
+        width_size=512, 
+        depth=2, 
+        y_dim=embed_dim, 
+        activation=jax.nn.gelu, 
+        time_embedder=SinusoidalPosEmb(embed_dim),
         key=key
     )
-
-    mesh = Mesh(jax.devices(), ('x',))
-    sharding = NamedSharding(mesh, P('x'))
 
     key, train_key, loader_key = jr.split(key, 3) 
 
@@ -112,11 +137,7 @@ if __name__ == "__main__":
 
     losses = []
     with trange(num_steps) as bar:
-        for step, xy in zip(
-            bar, dataset.train_dataloader.loop(batch_size)
-        ):
-            x, y = eqx.filter_shard(xy, sharding)
-
+        for step, x in zip(bar, dataloader(X, batch_size, key=loader_key)):
             value, model, train_key, opt_state = make_step(
                 model, weight, int_beta, x, t1, train_key, opt_state, opt.update
             )
@@ -128,7 +149,6 @@ if __name__ == "__main__":
                 plt.figure()
                 plt.semilogy(losses)
                 plt.savefig("figs/loss.png")
-                plt.close()
 
                 key, sample_key = jr.split(key)
                 sample_keys = jr.split(sample_key, sample_size ** 2)
@@ -136,21 +156,16 @@ if __name__ == "__main__":
                     single_sample_fn, model, int_beta, data_shape, dt0, t1
                 )
                 sample = jax.vmap(sample_fn)(sample_keys)
-                print("sample ", sample.shape)
                 sample = einops.rearrange(
                     sample, 
-                    "(n1 n2) 1 h w -> (n1 h) (n2 w)", 
+                    "(n1 n2) (h w) -> (n1 h) (n2 w)", 
                     n1=sample_size, 
                     n2=sample_size, 
-                    h=32, 
-                    w=32
+                    h=8, 
+                    w=8
                 )
 
-                plt.figure(dpi=200)
+                plt.figure()
                 plt.imshow(sample, cmap="gray_r")
                 plt.axis("off")
-                plt.savefig("figs/samples.png", bbox_inches="tight")
-                plt.close()
-
-                eqx.tree_serialise_leaves("sgm.eqx", model)
-                eqx.tree_serialise_leaves("opt.eqx", opt_state)
+                plt.savefig("figs/samples.png")
